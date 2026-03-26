@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, writeFile, rename, access } from 'fs/promises';
 import { join } from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -27,6 +27,11 @@ export async function pullCommand(options) {
   let totalFiles = 0;
   let updatedFiles = 0;
   let newFiles = 0;
+  let deletedFiles = 0;
+
+  // Track which remote IDs were seen per type to detect deletions
+  const pulledTypes = new Set();
+  const remoteIds = {}; // type -> Set<id>
 
   for (const type of typesToPull) {
     const typeConfig = CONTENT_TYPES[type];
@@ -44,6 +49,7 @@ export async function pullCommand(options) {
         if (result.isNew) newFiles += result.filesCreated;
         else if (result.isChanged) updatedFiles++;
         totalFiles += result.filesCreated;
+        pulledTypes.add(type);
         spinner.succeed(`${typeConfig.label}: ${result.filesCreated} files (${result.theme})`);
         continue;
       }
@@ -54,6 +60,10 @@ export async function pullCommand(options) {
         newFiles += result.newFiles;
         updatedFiles += result.updatedFiles;
         totalFiles += result.totalFiles;
+        if (result.remoteIds) {
+          remoteIds[type] = result.remoteIds;
+          pulledTypes.add(type);
+        }
         spinner.succeed(`${typeConfig.label}: ${result.totalFiles} items (${result.variableCount} variable)`);
         continue;
       }
@@ -63,6 +73,9 @@ export async function pullCommand(options) {
 
       const typeDir = join(contentDir, typeConfig.folder);
       await mkdir(typeDir, { recursive: true });
+
+      remoteIds[type] = new Set(items.map(i => i.id));
+      pulledTypes.add(type);
 
       for (const item of items) {
         const filename = generateFilename(item);
@@ -127,6 +140,9 @@ export async function pullCommand(options) {
       const taxDir = join(contentDir, taxConfig.folder);
       await mkdir(taxDir, { recursive: true });
 
+      remoteIds[taxonomy] = new Set(items.map(i => i.id));
+      pulledTypes.add(taxonomy);
+
       for (const item of items) {
         const filename = `${item.slug}.md`;
         const filepath = join(taxDir, filename);
@@ -163,6 +179,11 @@ export async function pullCommand(options) {
     }
   }
 
+  // Detect remote deletions: any tracked file whose type was pulled but whose
+  // ID is no longer present in WordPress should be marked as deleted locally.
+  const deleted = await markRemotelyDeletedFiles(contentDir, state, pulledTypes, remoteIds);
+  deletedFiles = deleted;
+
   state.lastSync = new Date().toISOString();
   await saveState(state, dir);
 
@@ -170,8 +191,56 @@ export async function pullCommand(options) {
   console.log(`   Total: ${totalFiles} files`);
   console.log(`   New: ${chalk.green(newFiles)}`);
   console.log(`   Updated: ${chalk.yellow(updatedFiles)}`);
-  console.log(`   Unchanged: ${chalk.dim(totalFiles - newFiles - updatedFiles)}`);
+  if (deletedFiles > 0) {
+    console.log(`   Deleted remotely: ${chalk.red(deletedFiles)} (marked as .deleted locally)`);
+  }
+  console.log(`   Unchanged: ${chalk.dim(totalFiles - newFiles - updatedFiles - deletedFiles)}`);
   console.log('');
+}
+
+/**
+ * For each tracked file whose type was fully pulled, check if its WordPress ID
+ * still appears in the remote set. If not, rename the local file to .deleted.
+ */
+async function markRemotelyDeletedFiles(contentDir, state, pulledTypes, remoteIds) {
+  let count = 0;
+
+  for (const [relativePath, entry] of Object.entries(state.files)) {
+    // Skip already-deleted entries and special/untracked types
+    if (entry.deleted) continue;
+    if (!entry.type || !entry.id) continue;
+    if (!pulledTypes.has(entry.type)) continue;
+
+    // wp_global_styles entries don't have simple ID-based deletion tracking
+    if (entry.type === 'wp_global_styles') continue;
+
+    const ids = remoteIds[entry.type];
+    if (!ids || ids.has(entry.id)) continue;
+
+    // This item no longer exists in WordPress — mark local file as deleted
+    const filepath = join(contentDir, relativePath);
+    const deletedPath = filepath + '.deleted';
+
+    try {
+      await access(filepath);
+      await rename(filepath, deletedPath);
+      console.log(chalk.red(`  Deleted remotely: ${relativePath} → ${relativePath}.deleted`));
+    } catch {
+      // Local file may already be missing or renamed; still update state
+    }
+
+    // Update state
+    delete state.files[relativePath];
+    state.files[relativePath + '.deleted'] = {
+      ...entry,
+      deleted: true,
+      deletedAt: new Date().toISOString(),
+    };
+
+    count++;
+  }
+
+  return count;
 }
 
 async function pullGlobalStyles(client, contentDir, state, force) {
@@ -236,6 +305,7 @@ async function pullWcProducts(client, contentDir, state, force, spinner) {
     newFiles: 0,
     updatedFiles: 0,
     variableCount: 0,
+    remoteIds: null,
   };
 
   // Check if WooCommerce is available
@@ -251,6 +321,8 @@ async function pullWcProducts(client, contentDir, state, force, spinner) {
 
   spinner.text = 'Fetching products via WooCommerce API...';
   const products = await client.fetchWcProducts();
+
+  result.remoteIds = new Set(products.map(p => p.id));
 
   for (const product of products) {
     spinner.text = `Processing ${product.name}...`;

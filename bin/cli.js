@@ -10,6 +10,7 @@ import { watchCommand } from '../src/commands/watch.js';
 import { newCommand } from '../src/commands/new.js';
 import { uploadCommand } from '../src/commands/upload.js';
 import { forcePushCommand } from '../src/commands/force-push.js';
+import { deleteCommand } from '../src/commands/delete.js';
 import { checkForUpdates, getCurrentVersion } from '../src/utils/version-check.js';
 
 // Check for updates in background
@@ -84,5 +85,11 @@ program
   .option('-d, --dir <directory>', 'Content directory (default: current directory)')
   .option('--dry-run', 'Show what would be pushed without making changes', false)
   .action(forcePushCommand);
+
+program
+  .command('delete <file>')
+  .description('Delete a WordPress item and mark the local file as .deleted')
+  .option('-d, --dir <directory>', 'Content directory (default: current directory)')
+  .action(deleteCommand);
 
 program.parse();
